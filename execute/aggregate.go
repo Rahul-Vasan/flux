@@ -58,14 +58,14 @@ type AggregateParallelTransformation interface {
 
 	// Merge will take two existing states produced by the Aggregate method and merge them
 	// into a single state.
-	Merge(state, other interface{}, mem memory.Allocator) (interface{}, error)
+	Merge(into, from interface{}, mem memory.Allocator) (interface{}, error)
 }
 
 type aggregateTransformation struct {
 	t AggregateTransformation
 	d *TransportDataset
 
-	merge    func(state, other interface{}, mem memory.Allocator) (interface{}, error)
+	merge    func(into, from interface{}, mem memory.Allocator) (interface{}, error)
 	parents  map[DatasetID]*RandomAccessGroupLookup
 	finished int
 	err      error
@@ -85,6 +85,10 @@ func NewAggregateTransformation(id DatasetID, t AggregateTransformation, mem mem
 // NewAggregateParallelTransformation constructs a Transformation and Dataset
 // using the AggregateParallelTransformation implementation.
 func NewAggregateParallelTransformation(id DatasetID, parents []DatasetID, t AggregateParallelTransformation, mem memory.Allocator) (Transformation, Dataset, error) {
+	if len(parents) == 1 {
+		return NewAggregateTransformation(id, t, mem)
+	}
+
 	tr := &aggregateTransformation{
 		t:       t,
 		d:       NewTransportDataset(id, mem),
@@ -148,7 +152,7 @@ func (t *aggregateTransformation) processChunk(parent DatasetID, chunk table.Chu
 	return nil
 }
 
-func (t *aggregateTransformation) mergeState(key flux.GroupKey, other interface{}) (done bool, err error) {
+func (t *aggregateTransformation) mergeState(key flux.GroupKey, from interface{}) (done bool, err error) {
 	merged := t.d.LookupOrCreate(key, func() interface{} {
 		return &aggregateParallelState{}
 	}).(*aggregateParallelState)
@@ -156,11 +160,18 @@ func (t *aggregateTransformation) mergeState(key flux.GroupKey, other interface{
 	if merged.state == nil {
 		// No existing state for this merge. Just take the passed in
 		// state. This works fine even if both sides are nil.
-		merged.state = other
-	} else if other != nil {
+		merged.state = from
+	} else if from != nil {
 		// We have merged state and new state.
 		// Merge these together with the merge function.
-		merged.state, err = t.merge(merged.state, other, t.d.mem)
+		merged.state, err = t.merge(merged.state, from, t.d.mem)
+
+		// If the from state was disposable, close it now.
+		if v, ok := from.(Closer); ok {
+			if err := v.Close(); err != nil {
+				return false, err
+			}
+		}
 	}
 	// Increment the count regardless of what happens.
 	merged.count++
